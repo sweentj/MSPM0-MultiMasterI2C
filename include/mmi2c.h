@@ -1,5 +1,5 @@
-#ifndef SOLINST_MMI2C_H
-#define SOLINST_MMI2C_H
+#ifndef MMI2C_H
+#define MMI2C_H
 
 #include <stdbool.h>
 #include <stddef.h>

@@ -116,6 +116,10 @@ When the result stops being `MMI2C_RESULT_IN_PROGRESS`, consume it with
 `mmi2c_take_result()`. A completed context deliberately remains unavailable
 until the result is taken so an error cannot be silently overwritten.
 
+For a complete bare-metal packet application using button/timer requests,
+chunked Apollo3 IOS direct-area writes, bounded retries, and one PCA9615 power
+cycle per packet, see `examples/apollo3_ios_packet/README.md`.
+
 ## Arbitration behavior
 
 On arbitration loss, hardware releases the bus. The library then follows TI's
@@ -170,6 +174,13 @@ reports both controller IDLE and bus-not-busy, so the PCA9615 cannot be
 disconnected before the transaction's STOP condition reaches the bus. Continue
 calling `mmi2c_process()` after observing a result; the normal main-loop pattern
 in the example already does this.
+
+For a batch made from several I2C transactions, set
+`release_bridge_when_done = false`, complete every transaction in the batch,
+then call `mmi2c_release_bridge()` until it returns `MMI2C_RESULT_OK`. This keeps
+VDD(B)/EN active between chunks without allowing the application to disconnect
+the PCA9615 during a transfer or before STOP has released the bus. The
+`apollo3_ios_packet` example uses this pattern.
 
 ## Stuck-bus recovery
 

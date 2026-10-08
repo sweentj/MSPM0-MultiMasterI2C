@@ -140,6 +140,14 @@ mmi2c_result_t mmi2c_take_result(mmi2c_t *context);
 
 bool mmi2c_is_busy(const mmi2c_t *context);
 
+/**
+ * Explicitly releases a bridge retained with release_bridge_when_done=false.
+ * Returns BUSY until the I2C peripheral reports both IDLE and bus-not-busy.
+ * It is safe to call repeatedly. This function never interrupts an active
+ * transfer and does nothing when no bridge is acquired.
+ */
+mmi2c_result_t mmi2c_release_bridge(mmi2c_t *context);
+
 #ifdef __cplusplus
 }
 #endif

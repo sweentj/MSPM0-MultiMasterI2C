@@ -448,3 +448,29 @@ bool mmi2c_is_busy(const mmi2c_t *context)
     return (context != NULL) && (context->state != MMI2C_STATE_IDLE) &&
            (context->state != MMI2C_STATE_COMPLETE);
 }
+
+mmi2c_result_t mmi2c_release_bridge(mmi2c_t *context)
+{
+    if ((context == NULL) || (context->regs == NULL) ||
+        (context->state == MMI2C_STATE_UNINITIALIZED)) {
+        return MMI2C_RESULT_INVALID_ARGUMENT;
+    }
+    if (mmi2c_is_busy(context)) {
+        return MMI2C_RESULT_BUSY;
+    }
+    if (!context->bridge_acquired) {
+        return MMI2C_RESULT_OK;
+    }
+
+    uint32_t status = DL_I2C_getControllerStatus(context->regs);
+    if (((status & DL_I2C_CONTROLLER_STATUS_BUSY_BUS) != 0u) ||
+        ((status & DL_I2C_CONTROLLER_STATUS_IDLE) == 0u)) {
+        return MMI2C_RESULT_BUSY;
+    }
+
+    if (context->config.bridge_release != NULL) {
+        context->config.bridge_release(context->config.user);
+    }
+    context->bridge_acquired = false;
+    return MMI2C_RESULT_OK;
+}

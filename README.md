@@ -66,8 +66,9 @@ For the chosen I2C instance:
 
 1. Configure it as a controller at 400 kHz.
 2. Enable the controller peripheral and configure SDA/SCL pins.
-3. Select TX and RX FIFO thresholds of one byte. The library also drains all
-   available RX bytes each time it is interrupted.
+3. Select TX and RX FIFO thresholds of one byte. Each RX FIFO interrupt removes
+   at most one byte; if more bytes remain, the peripheral requests another
+   interrupt.
 4. Do not enable DMA for the same I2C instance.
 5. Let SysConfig generate `ti_msp_dl_config.c/.h`.
 6. Add `include/mmi2c.h` and `src/mmi2c.c` to the project.
@@ -76,7 +77,7 @@ For the chosen I2C instance:
 
 `mmi2c_init()` explicitly sets `MCR.MMST`, which makes the SCL high-period timer
 start only after SCL is actually observed high. It also enables RX/TX done,
-FIFO, NACK, STOP, and arbitration-loss peripheral interrupts.
+FIFO, NACK, START, STOP, and arbitration-loss peripheral interrupts.
 
 The implementation also accounts for current G351x and L111x I2C errata:
 
@@ -122,14 +123,33 @@ cycle per packet, see `examples/apollo3_ios_packet/README.md`.
 
 ## Arbitration behavior
 
-On arbitration loss, hardware releases the bus. The library then follows TI's
-documented sequence:
+The library uses one explicit `bus_locked` flag:
+
+- A START detected while this controller has not started a transaction locks
+  the bus.
+- Arbitration loss locks the bus and flushes this controller's FIFOs. It does
+  not generate STOP because the winning controller owns the transaction.
+- STOP clears the lock, unless hardware already reports another transaction in
+  progress.
+- A new transfer starts only when the software lock is clear and hardware
+  reports both controller IDLE and bus-not-busy.
+
+The hardware BUSBSY check is still required. If this MCU connects or enables
+its controller halfway through another controller's transaction, it may not
+have observed that transaction's START interrupt.
+
+The START interrupt does not identify which controller generated it. The
+library treats it as its own only while its state is `TRANSMITTING` or
+`RECEIVING`; in every other state it is treated as an external START.
+
+After arbitration loss, the complete application transfer is retried:
 
 1. mask the TX FIFO trigger and TX-empty sources;
 2. clear those pending interrupt flags;
 3. flush the TX FIFO;
 4. do **not** generate STOP, because the winning controller owns the bus;
-5. wait for the winner's STOP, controller IDLE, and `ARBLST` to clear;
+5. wait for the winner's STOP, the software bus lock to clear, and hardware
+   BUSBSY/ARBLST to clear;
 6. wait a randomized backoff; and
 7. refill the FIFO and retry the complete application transaction.
 
@@ -142,6 +162,15 @@ NACK retries default to zero in the example. NACK is usually a protocol or
 target-readiness problem, not contention, so retrying it automatically can hide
 a fault. Arbitration loss is the only condition that normally merits automatic
 retry.
+
+## Interrupt behavior
+
+`mmi2c_handle_irq()` reads IIDX once, handles that one event, and returns. There
+is no interrupt-draining loop. Reading IIDX clears the selected event; if
+another event remains pending, the MSPM0 asserts the IRQ again. RX FIFO events
+remove one byte per ISR invocation. The only FIFO-draining loop is in
+`mmi2c_process()` after the RXDONE settling delay, so it runs in main-loop
+context rather than interrupt context.
 
 ## Identical-transfer limitation
 

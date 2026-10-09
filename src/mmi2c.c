@@ -2,21 +2,74 @@
 
 #include <string.h>
 
-#define MMI2C_BASE_INTERRUPTS                                                \
-    (DL_I2C_INTERRUPT_CONTROLLER_RX_DONE |                                  \
-        DL_I2C_INTERRUPT_CONTROLLER_TX_DONE |                               \
-        DL_I2C_INTERRUPT_CONTROLLER_RXFIFO_TRIGGER |                        \
-        DL_I2C_INTERRUPT_CONTROLLER_NACK |                                  \
-        DL_I2C_INTERRUPT_CONTROLLER_STOP |                                  \
+/*
+ * State flow
+ * ----------
+ *
+ * submit -> WAITING_FOR_BUS -> TRANSMITTING -> [RECEIVING] -> COMPLETE
+ *                         \-> RECEIVING --------------------/
+ *
+ * Arbitration loss or a configured NACK retry moves the transfer to
+ * WAITING_TO_RETRY. The main loop waits for the backoff time and an idle bus,
+ * then restarts the whole transfer.
+ *
+ * Bus ownership is deliberately simple:
+ *   - an external START or arbitration loss locks the bus;
+ *   - STOP unlocks the bus; and
+ *   - BUSBSY is always checked as a hardware safety net.
+ *
+ * The ISR handles exactly one pending event per invocation. If another event
+ * remains pending, the peripheral asserts its IRQ again after the ISR returns.
+ */
+
+#define MMI2C_NORMAL_INTERRUPTS                                             \
+    (DL_I2C_INTERRUPT_CONTROLLER_RX_DONE |                                 \
+        DL_I2C_INTERRUPT_CONTROLLER_TX_DONE |                              \
+        DL_I2C_INTERRUPT_CONTROLLER_RXFIFO_TRIGGER |                       \
+        DL_I2C_INTERRUPT_CONTROLLER_NACK |                                 \
+        DL_I2C_INTERRUPT_CONTROLLER_START |                                \
+        DL_I2C_INTERRUPT_CONTROLLER_STOP |                                 \
         DL_I2C_INTERRUPT_CONTROLLER_ARBITRATION_LOST)
 
-#define MMI2C_TX_INTERRUPTS                                                  \
-    (DL_I2C_INTERRUPT_CONTROLLER_TXFIFO_TRIGGER |                           \
+#define MMI2C_TX_FIFO_INTERRUPTS                                            \
+    (DL_I2C_INTERRUPT_CONTROLLER_TXFIFO_TRIGGER |                          \
         DL_I2C_INTERRUPT_CONTROLLER_TXFIFO_EMPTY)
 
 static bool time_reached(uint32_t now, uint32_t target)
 {
     return ((int32_t) (now - target) >= 0);
+}
+
+static uint32_t controller_status(const mmi2c_t *context)
+{
+    return DL_I2C_getControllerStatus(context->regs);
+}
+
+static bool hardware_bus_is_idle(const mmi2c_t *context)
+{
+    uint32_t status = controller_status(context);
+    return ((status & DL_I2C_CONTROLLER_STATUS_BUSY_BUS) == 0u) &&
+           ((status & DL_I2C_CONTROLLER_STATUS_IDLE) != 0u) &&
+           ((status & DL_I2C_CONTROLLER_STATUS_ARBITRATION_LOST) == 0u);
+}
+
+static bool bus_is_available(const mmi2c_t *context)
+{
+    return !context->bus_locked && hardware_bus_is_idle(context);
+}
+
+static bool controller_has_error(const mmi2c_t *context)
+{
+    uint32_t status = controller_status(context);
+    return (status & (DL_I2C_CONTROLLER_STATUS_ERROR |
+                         DL_I2C_CONTROLLER_STATUS_ARBITRATION_LOST)) != 0u;
+}
+
+static bool transfer_is_active(const mmi2c_t *context)
+{
+    return (context->state == MMI2C_STATE_TRANSMITTING) ||
+           (context->state == MMI2C_STATE_RECEIVING) ||
+           (context->state == MMI2C_STATE_RECEIVE_SETTLE);
 }
 
 static uint32_t next_random(mmi2c_t *context)
@@ -29,47 +82,56 @@ static uint32_t next_random(mmi2c_t *context)
     return context->prng;
 }
 
-static void drain_rx_fifo(mmi2c_t *context)
+/* Read at most one byte. This is the only RX helper called by the ISR. */
+static void receive_one_byte(mmi2c_t *context)
+{
+    if (DL_I2C_isControllerRXFIFOEmpty(context->regs)) {
+        return;
+    }
+
+    uint8_t data = DL_I2C_receiveControllerData(context->regs);
+    if (context->rx_count < context->transfer.rx_length) {
+        context->transfer.rx_data[context->rx_count] = data;
+        ++context->rx_count;
+    }
+}
+
+/* This loop runs only from mmi2c_process(), never from the ISR. */
+static void drain_rx_fifo_from_main(mmi2c_t *context)
 {
     while (!DL_I2C_isControllerRXFIFOEmpty(context->regs)) {
-        uint8_t data = DL_I2C_receiveControllerData(context->regs);
-        if (context->rx_count < context->transfer.rx_length) {
-            context->transfer.rx_data[context->rx_count++] = data;
-        }
+        receive_one_byte(context);
     }
 }
 
-static void release_bridge(mmi2c_t *context)
+static void release_bridge_automatically(mmi2c_t *context)
 {
-    if (context->bridge_acquired && context->config.release_bridge_when_done &&
-        (context->config.bridge_release != NULL)) {
-        uint32_t status = DL_I2C_getControllerStatus(context->regs);
-        /* Do not disconnect before the STOP has physically released the bus. */
-        if (((status & DL_I2C_CONTROLLER_STATUS_BUSY_BUS) != 0u) ||
-            ((status & DL_I2C_CONTROLLER_STATUS_IDLE) == 0u)) {
-            return;
-        }
-        context->config.bridge_release(context->config.user);
-        context->bridge_acquired = false;
+    if (!context->bridge_acquired ||
+        !context->config.release_bridge_when_done ||
+        (context->config.bridge_release == NULL) ||
+        !bus_is_available(context)) {
+        return;
     }
+
+    context->config.bridge_release(context->config.user);
+    context->bridge_acquired = false;
 }
 
-static void finish(mmi2c_t *context, mmi2c_result_t result)
+static void complete_transfer(mmi2c_t *context, mmi2c_result_t result)
 {
-    DL_I2C_disableInterrupt(context->regs, MMI2C_TX_INTERRUPTS);
+    DL_I2C_disableInterrupt(context->regs, MMI2C_TX_FIFO_INTERRUPTS);
     context->result = result;
     context->state  = MMI2C_STATE_COMPLETE;
-    release_bridge(context);
+    release_bridge_automatically(context);
 }
 
-static void start_rx(mmi2c_t *context)
+static void start_receive(mmi2c_t *context)
 {
     DL_I2C_flushControllerRXFIFO(context->regs);
     context->rx_count = 0u;
     context->state    = MMI2C_STATE_RECEIVING;
-    context->deadline_us =
-        context->config.now_us(context->config.user) +
-        context->config.transfer_timeout_us;
+    context->deadline_us = context->config.now_us(context->config.user) +
+                           context->config.transfer_timeout_us;
 
     DL_I2C_startControllerTransferAdvanced(context->regs,
         context->transfer.address, DL_I2C_CONTROLLER_DIRECTION_RX,
@@ -77,21 +139,22 @@ static void start_rx(mmi2c_t *context)
         DL_I2C_CONTROLLER_STOP_ENABLE, DL_I2C_CONTROLLER_ACK_DISABLE);
 }
 
-static void start_attempt(mmi2c_t *context)
+static void start_transfer(mmi2c_t *context)
 {
     context->tx_count = 0u;
     context->rx_count = 0u;
     DL_I2C_flushControllerTXFIFO(context->regs);
     DL_I2C_flushControllerRXFIFO(context->regs);
-    DL_I2C_clearInterruptStatus(context->regs, MMI2C_TX_INTERRUPTS);
+    DL_I2C_clearInterruptStatus(context->regs, MMI2C_TX_FIFO_INTERRUPTS);
 
     if (context->transfer.tx_length == 0u) {
-        start_rx(context);
+        start_receive(context);
         return;
     }
 
     context->tx_count = DL_I2C_fillControllerTXFIFO(context->regs,
         context->transfer.tx_data, context->transfer.tx_length);
+
     if (context->tx_count < context->transfer.tx_length) {
         DL_I2C_enableInterrupt(context->regs,
             DL_I2C_INTERRUPT_CONTROLLER_TXFIFO_TRIGGER);
@@ -101,9 +164,8 @@ static void start_attempt(mmi2c_t *context)
     }
 
     context->state = MMI2C_STATE_TRANSMITTING;
-    context->deadline_us =
-        context->config.now_us(context->config.user) +
-        context->config.transfer_timeout_us;
+    context->deadline_us = context->config.now_us(context->config.user) +
+                           context->config.transfer_timeout_us;
 
     DL_I2C_startControllerTransferAdvanced(context->regs,
         context->transfer.address, DL_I2C_CONTROLLER_DIRECTION_TX,
@@ -113,27 +175,22 @@ static void start_attempt(mmi2c_t *context)
         DL_I2C_CONTROLLER_ACK_DISABLE);
 }
 
-static void schedule_retry(mmi2c_t *context, bool arbitration_lost)
+static void retry_or_complete(mmi2c_t *context, mmi2c_result_t reason)
 {
-    uint8_t retry_count;
-    uint8_t retry_limit;
+    bool arbitration_lost = (reason == MMI2C_RESULT_ARBITRATION_LOST);
+    uint8_t retry_count = arbitration_lost ? context->arbitration_retries
+                                           : context->nack_retries;
+    uint8_t retry_limit = arbitration_lost
+                              ? context->config.max_arbitration_retries
+                              : context->config.max_nack_retries;
 
-    DL_I2C_disableInterrupt(context->regs, MMI2C_TX_INTERRUPTS);
-    DL_I2C_clearInterruptStatus(context->regs, MMI2C_TX_INTERRUPTS);
+    DL_I2C_disableInterrupt(context->regs, MMI2C_TX_FIFO_INTERRUPTS);
+    DL_I2C_clearInterruptStatus(context->regs, MMI2C_TX_FIFO_INTERRUPTS);
     DL_I2C_flushControllerTXFIFO(context->regs);
     DL_I2C_flushControllerRXFIFO(context->regs);
 
-    if (arbitration_lost) {
-        retry_count = context->arbitration_retries;
-        retry_limit = context->config.max_arbitration_retries;
-    } else {
-        retry_count = context->nack_retries;
-        retry_limit = context->config.max_nack_retries;
-    }
-
     if (retry_count >= retry_limit) {
-        finish(context, arbitration_lost ? MMI2C_RESULT_ARBITRATION_LOST
-                                         : MMI2C_RESULT_NACK);
+        complete_transfer(context, reason);
         return;
     }
 
@@ -143,36 +200,69 @@ static void schedule_retry(mmi2c_t *context, bool arbitration_lost)
     } else {
         context->nack_retries = retry_count;
     }
-    uint8_t exponent = retry_count;
-    if (exponent > 8u) {
-        exponent = 8u;
-    }
-    uint32_t slots = (1u << exponent) - 1u;
-    uint32_t delay = (next_random(context) % (slots + 1u)) *
-                     (uint32_t) context->config.backoff_slot_us;
 
-    context->retry_at_us = context->config.now_us(context->config.user) + delay;
-    /* The idle timeout begins after backoff, not before it. Otherwise a later
-     * exponential-backoff attempt could time out before it is eligible. */
-    context->deadline_us =
-        context->retry_at_us + context->config.bus_idle_timeout_us;
+    uint8_t exponent = (retry_count > 8u) ? 8u : retry_count;
+    uint32_t slot_count = (1u << exponent);
+    uint32_t delay_us =
+        (next_random(context) % slot_count) * context->config.backoff_slot_us;
+
+    context->retry_at_us = context->config.now_us(context->config.user) +
+                           delay_us;
+    context->deadline_us = context->retry_at_us +
+                           context->config.bus_idle_timeout_us;
     context->state = MMI2C_STATE_WAITING_TO_RETRY;
+}
+
+static bool config_is_valid(
+    I2C_Regs *regs, const mmi2c_config_t *config)
+{
+    if ((regs == NULL) || (config == NULL) || (config->now_us == NULL) ||
+        (config->bus_idle_timeout_us == 0u) ||
+        (config->transfer_timeout_us == 0u) ||
+        (config->rx_done_settle_us == 0u)) {
+        return false;
+    }
+    if ((config->bridge_acquire != NULL) &&
+        (config->bridge_ready_timeout_us == 0u)) {
+        return false;
+    }
+    if (config->release_bridge_when_done &&
+        (config->bridge_release == NULL)) {
+        return false;
+    }
+    if (((config->max_arbitration_retries != 0u) ||
+            (config->max_nack_retries != 0u)) &&
+        ((config->backoff_slot_us == 0u) || (config->random_seed == 0u))) {
+        return false;
+    }
+    return true;
+}
+
+static bool transfer_is_valid(const mmi2c_transfer_t *transfer)
+{
+    if ((transfer == NULL) || (transfer->address > 0x7Fu)) {
+        return false;
+    }
+    if ((transfer->tx_length == 0u) && (transfer->rx_length == 0u)) {
+        return false;
+    }
+    if (((uint32_t) transfer->tx_length + transfer->rx_length) >
+        MMI2C_MAX_MESSAGE_BYTES) {
+        return false;
+    }
+    if ((transfer->tx_length != 0u) && (transfer->tx_data == NULL)) {
+        return false;
+    }
+    if ((transfer->rx_length != 0u) && (transfer->rx_data == NULL)) {
+        return false;
+    }
+    return true;
 }
 
 mmi2c_result_t mmi2c_init(
     mmi2c_t *context, I2C_Regs *regs, const mmi2c_config_t *config)
 {
-    if ((context == NULL) || (regs == NULL) || (config == NULL) ||
-        (config->now_us == NULL) || (config->bus_idle_timeout_us == 0u) ||
-        (config->transfer_timeout_us == 0u) ||
-        (config->rx_done_settle_us == 0u) ||
-        ((config->bridge_acquire != NULL) &&
-            (config->bridge_ready_timeout_us == 0u)) ||
-        (config->release_bridge_when_done &&
-            (config->bridge_release == NULL)) ||
-        ((config->max_arbitration_retries != 0u) &&
-            ((config->backoff_slot_us == 0u) ||
-                (config->random_seed == 0u)))) {
+    if ((context == NULL) || !config_is_valid(regs, config)) {
         return MMI2C_RESULT_INVALID_ARGUMENT;
     }
 
@@ -184,24 +274,17 @@ mmi2c_result_t mmi2c_init(
     context->result = MMI2C_RESULT_NONE;
 
     DL_I2C_enableMultiControllerMode(regs);
-    DL_I2C_enableInterrupt(regs, MMI2C_BASE_INTERRUPTS);
-    DL_I2C_disableInterrupt(regs, MMI2C_TX_INTERRUPTS);
+    DL_I2C_enableInterrupt(regs, MMI2C_NORMAL_INTERRUPTS);
+    DL_I2C_disableInterrupt(regs, MMI2C_TX_FIFO_INTERRUPTS);
     return MMI2C_RESULT_OK;
 }
 
 mmi2c_result_t mmi2c_submit(
     mmi2c_t *context, const mmi2c_transfer_t *transfer)
 {
-    if ((context == NULL) || (transfer == NULL) ||
+    if ((context == NULL) ||
         (context->state == MMI2C_STATE_UNINITIALIZED) ||
-        (transfer->address > 0x7Fu) ||
-        ((transfer->tx_length == 0u) && (transfer->rx_length == 0u)) ||
-        (transfer->tx_length > MMI2C_MAX_MESSAGE_BYTES) ||
-        (transfer->rx_length > MMI2C_MAX_MESSAGE_BYTES) ||
-        (((uint32_t) transfer->tx_length + transfer->rx_length) >
-            MMI2C_MAX_MESSAGE_BYTES) ||
-        ((transfer->tx_length != 0u) && (transfer->tx_data == NULL)) ||
-        ((transfer->rx_length != 0u) && (transfer->rx_data == NULL))) {
+        !transfer_is_valid(transfer)) {
         return MMI2C_RESULT_INVALID_ARGUMENT;
     }
     if (context->state != MMI2C_STATE_IDLE) {
@@ -216,9 +299,10 @@ mmi2c_result_t mmi2c_submit(
 
     if (!context->bridge_acquired &&
         (context->config.bridge_acquire != NULL)) {
-        if (!context->config.bridge_acquire(context->config.user,
-                context->config.bridge_ready_timeout_us)) {
-            finish(context, MMI2C_RESULT_BRIDGE_NOT_READY);
+        bool ready = context->config.bridge_acquire(context->config.user,
+            context->config.bridge_ready_timeout_us);
+        if (!ready) {
+            complete_transfer(context, MMI2C_RESULT_BRIDGE_NOT_READY);
             return MMI2C_RESULT_BRIDGE_NOT_READY;
         }
         context->bridge_acquired = true;
@@ -227,8 +311,46 @@ mmi2c_result_t mmi2c_submit(
     context->deadline_us = context->config.now_us(context->config.user) +
                            context->config.bus_idle_timeout_us;
     context->state = MMI2C_STATE_WAITING_FOR_BUS;
+
+    /* Start immediately if no other controller owns the bus. */
     mmi2c_process(context);
     return context->result;
+}
+
+static void handle_transfer_timeout(mmi2c_t *context)
+{
+    DL_I2C_resetControllerTransfer(context->regs);
+    DL_I2C_flushControllerTXFIFO(context->regs);
+    DL_I2C_flushControllerRXFIFO(context->regs);
+    complete_transfer(context, MMI2C_RESULT_TRANSFER_TIMEOUT);
+}
+
+static void process_bus_wait(mmi2c_t *context, uint32_t now)
+{
+    bool backoff_finished =
+        (context->state == MMI2C_STATE_WAITING_FOR_BUS) ||
+        time_reached(now, context->retry_at_us);
+
+    if (backoff_finished && bus_is_available(context)) {
+        start_transfer(context);
+        return;
+    }
+
+    if (!time_reached(now, context->deadline_us)) {
+        return;
+    }
+
+    if (!context->recovery_attempted &&
+        (context->config.bus_recover != NULL)) {
+        context->recovery_attempted = true;
+        if (context->config.bus_recover(context->config.user)) {
+            context->bus_locked = false;
+            context->deadline_us = now + context->config.bus_idle_timeout_us;
+            return;
+        }
+    }
+
+    complete_transfer(context, MMI2C_RESULT_BUS_BUSY_TIMEOUT);
 }
 
 void mmi2c_process(mmi2c_t *context)
@@ -237,66 +359,134 @@ void mmi2c_process(mmi2c_t *context)
         return;
     }
 
-    uint32_t now    = context->config.now_us(context->config.user);
-    uint32_t status = DL_I2C_getControllerStatus(context->regs);
+    uint32_t now = context->config.now_us(context->config.user);
 
-    if ((context->state == MMI2C_STATE_IDLE) ||
-        (context->state == MMI2C_STATE_COMPLETE)) {
-        release_bridge(context);
-        return;
-    }
+    switch (context->state) {
+        case MMI2C_STATE_IDLE:
+        case MMI2C_STATE_COMPLETE:
+            release_bridge_automatically(context);
+            break;
 
-    if (context->state == MMI2C_STATE_RECEIVE_SETTLE) {
-        if (time_reached(now, context->retry_at_us)) {
-            drain_rx_fifo(context);
-            finish(context,
-                (context->rx_count == context->transfer.rx_length)
-                    ? MMI2C_RESULT_OK
-                    : MMI2C_RESULT_SHORT_READ);
-        } else if (time_reached(now, context->deadline_us)) {
-            finish(context, MMI2C_RESULT_TRANSFER_TIMEOUT);
-        }
-        return;
-    }
+        case MMI2C_STATE_WAITING_FOR_BUS:
+        case MMI2C_STATE_WAITING_TO_RETRY:
+            process_bus_wait(context, now);
+            break;
 
-    if ((context->state == MMI2C_STATE_TRANSMITTING) ||
-        (context->state == MMI2C_STATE_RECEIVING)) {
-        if (time_reached(now, context->deadline_us)) {
-            DL_I2C_resetControllerTransfer(context->regs);
-            DL_I2C_flushControllerTXFIFO(context->regs);
-            DL_I2C_flushControllerRXFIFO(context->regs);
-            finish(context, MMI2C_RESULT_TRANSFER_TIMEOUT);
-        }
-        return;
-    }
-
-    if ((context->state != MMI2C_STATE_WAITING_FOR_BUS) &&
-        (context->state != MMI2C_STATE_WAITING_TO_RETRY)) {
-        return;
-    }
-
-    bool bus_idle = ((status & DL_I2C_CONTROLLER_STATUS_BUSY_BUS) == 0u) &&
-                    ((status & DL_I2C_CONTROLLER_STATUS_IDLE) != 0u) &&
-                    ((status & DL_I2C_CONTROLLER_STATUS_ARBITRATION_LOST) == 0u);
-    bool backoff_done = (context->state == MMI2C_STATE_WAITING_FOR_BUS) ||
-                        time_reached(now, context->retry_at_us);
-
-    if (bus_idle && backoff_done) {
-        start_attempt(context);
-        return;
-    }
-
-    if (time_reached(now, context->deadline_us)) {
-        if (!context->recovery_attempted &&
-            (context->config.bus_recover != NULL)) {
-            context->recovery_attempted = true;
-            if (context->config.bus_recover(context->config.user)) {
-                context->deadline_us = now + context->config.bus_idle_timeout_us;
-                return;
+        case MMI2C_STATE_TRANSMITTING:
+        case MMI2C_STATE_RECEIVING:
+            if (time_reached(now, context->deadline_us)) {
+                handle_transfer_timeout(context);
             }
-        }
-        finish(context, MMI2C_RESULT_BUS_BUSY_TIMEOUT);
+            break;
+
+        case MMI2C_STATE_RECEIVE_SETTLE:
+            if (time_reached(now, context->retry_at_us)) {
+                drain_rx_fifo_from_main(context);
+                complete_transfer(context,
+                    (context->rx_count == context->transfer.rx_length)
+                        ? MMI2C_RESULT_OK
+                        : MMI2C_RESULT_SHORT_READ);
+            } else if (time_reached(now, context->deadline_us)) {
+                handle_transfer_timeout(context);
+            }
+            break;
+
+        case MMI2C_STATE_UNINITIALIZED:
+        default:
+            break;
     }
+}
+
+static void handle_tx_fifo_request(mmi2c_t *context)
+{
+    if (context->state != MMI2C_STATE_TRANSMITTING) {
+        return;
+    }
+
+    uint16_t remaining = context->transfer.tx_length - context->tx_count;
+    context->tx_count += DL_I2C_fillControllerTXFIFO(context->regs,
+        &context->transfer.tx_data[context->tx_count], remaining);
+
+    if (context->tx_count == context->transfer.tx_length) {
+        DL_I2C_disableInterrupt(context->regs,
+            DL_I2C_INTERRUPT_CONTROLLER_TXFIFO_TRIGGER);
+    }
+}
+
+static void handle_tx_done(mmi2c_t *context)
+{
+    DL_I2C_disableInterrupt(context->regs, MMI2C_TX_FIFO_INTERRUPTS);
+
+    if ((context->state != MMI2C_STATE_TRANSMITTING) ||
+        controller_has_error(context)) {
+        /* NACK or arbitration loss has its own pending interrupt. */
+        return;
+    }
+
+    if (context->transfer.rx_length != 0u) {
+        start_receive(context);
+    } else {
+        complete_transfer(context, MMI2C_RESULT_OK);
+    }
+}
+
+static void handle_rx_done(mmi2c_t *context)
+{
+    if ((context->state != MMI2C_STATE_RECEIVING) ||
+        controller_has_error(context)) {
+        return;
+    }
+
+    /* I2C_ERR_08: wait at least two functional clocks before the final read. */
+    context->retry_at_us = context->config.now_us(context->config.user) +
+                           context->config.rx_done_settle_us;
+    context->state = MMI2C_STATE_RECEIVE_SETTLE;
+}
+
+static void handle_start(mmi2c_t *context)
+{
+    bool this_controller_started =
+        (context->state == MMI2C_STATE_TRANSMITTING) ||
+        (context->state == MMI2C_STATE_RECEIVING);
+
+    if (!this_controller_started) {
+        context->bus_locked = true;
+    }
+}
+
+static void handle_stop(mmi2c_t *context)
+{
+    /* BUSBSY can already be set again if another START immediately followed
+     * this STOP. Preserve the lock in that case. */
+    context->bus_locked =
+        (controller_status(context) & DL_I2C_CONTROLLER_STATUS_BUSY_BUS) != 0u;
+}
+
+static void handle_arbitration_lost(mmi2c_t *context)
+{
+    if (!transfer_is_active(context)) {
+        return;
+    }
+
+    uint32_t status = controller_status(context);
+    context->bus_locked =
+        (status & (DL_I2C_CONTROLLER_STATUS_BUSY_BUS |
+                      DL_I2C_CONTROLLER_STATUS_ARBITRATION_LOST)) != 0u;
+
+    /* Never generate STOP here; the winning controller owns the bus. */
+    retry_or_complete(context, MMI2C_RESULT_ARBITRATION_LOST);
+}
+
+static void handle_nack(mmi2c_t *context)
+{
+    if (!transfer_is_active(context)) {
+        return;
+    }
+
+    /* A combined TX/RX transfer disabled STOP for its TX phase. Re-enable it
+     * so a NACK always releases the transaction before retry/completion. */
+    DL_I2C_enableStopCondition(context->regs);
+    retry_or_complete(context, MMI2C_RESULT_NACK);
 }
 
 void mmi2c_handle_irq(mmi2c_t *context)
@@ -305,122 +495,50 @@ void mmi2c_handle_irq(mmi2c_t *context)
         return;
     }
 
-    DL_I2C_IIDX source;
-    do {
-        source = DL_I2C_getPendingInterrupt(context->regs);
-        switch (source) {
-            case DL_I2C_IIDX_CONTROLLER_TXFIFO_TRIGGER:
-                if (context->state == MMI2C_STATE_TRANSMITTING) {
-                    uint16_t remaining =
-                        context->transfer.tx_length - context->tx_count;
-                    context->tx_count += DL_I2C_fillControllerTXFIFO(
-                        context->regs,
-                        &context->transfer.tx_data[context->tx_count], remaining);
-                    if (context->tx_count == context->transfer.tx_length) {
-                        DL_I2C_disableInterrupt(context->regs,
-                            DL_I2C_INTERRUPT_CONTROLLER_TXFIFO_TRIGGER);
-                    }
-                }
-                break;
+    /* Handle one event only. Any remaining event retriggers the IRQ. */
+    DL_I2C_IIDX source = DL_I2C_getPendingInterrupt(context->regs);
 
-            case DL_I2C_IIDX_CONTROLLER_RXFIFO_TRIGGER:
-            case DL_I2C_IIDX_CONTROLLER_RXFIFO_FULL:
-                if ((context->state == MMI2C_STATE_RECEIVING) ||
-                    (context->state == MMI2C_STATE_RECEIVE_SETTLE)) {
-                    drain_rx_fifo(context);
-                }
-                break;
+    switch (source) {
+        case DL_I2C_IIDX_CONTROLLER_TXFIFO_TRIGGER:
+            handle_tx_fifo_request(context);
+            break;
 
-            case DL_I2C_IIDX_CONTROLLER_TX_DONE:
-                DL_I2C_disableInterrupt(context->regs, MMI2C_TX_INTERRUPTS);
-                if (context->state == MMI2C_STATE_TRANSMITTING) {
-                    uint32_t status =
-                        DL_I2C_getControllerStatus(context->regs);
-                    /* DONE has higher IIDX priority than NACK/ARBLST. Leave
-                     * the state active so the pending error is handled next. */
-                    if ((status & (DL_I2C_CONTROLLER_STATUS_ERROR |
-                                      DL_I2C_CONTROLLER_STATUS_ARBITRATION_LOST)) !=
-                        0u) {
-                        break;
-                    } else if (context->transfer.rx_length != 0u) {
-                        start_rx(context);
-                    } else {
-                        finish(context, MMI2C_RESULT_OK);
-                    }
-                }
-                break;
+        case DL_I2C_IIDX_CONTROLLER_RXFIFO_TRIGGER:
+        case DL_I2C_IIDX_CONTROLLER_RXFIFO_FULL:
+            if ((context->state == MMI2C_STATE_RECEIVING) ||
+                (context->state == MMI2C_STATE_RECEIVE_SETTLE)) {
+                receive_one_byte(context);
+            }
+            break;
 
-            case DL_I2C_IIDX_CONTROLLER_RX_DONE:
-                if (context->state == MMI2C_STATE_RECEIVING) {
-                    uint32_t status =
-                        DL_I2C_getControllerStatus(context->regs);
-                    if ((status & (DL_I2C_CONTROLLER_STATUS_ERROR |
-                                      DL_I2C_CONTROLLER_STATUS_ARBITRATION_LOST)) !=
-                        0u) {
-                        break;
-                    }
-                    /* I2C_ERR_08: the last FIFO byte may not be visible at
-                     * RXDONE. Defer the final read by >= 2 functional clocks. */
-                    context->retry_at_us =
-                        context->config.now_us(context->config.user) +
-                        context->config.rx_done_settle_us;
-                    context->state = MMI2C_STATE_RECEIVE_SETTLE;
-                }
-                break;
+        case DL_I2C_IIDX_CONTROLLER_TX_DONE:
+            handle_tx_done(context);
+            break;
 
-            case DL_I2C_IIDX_CONTROLLER_ARBITRATION_LOST:
-                if ((context->state == MMI2C_STATE_TRANSMITTING) ||
-                    (context->state == MMI2C_STATE_RECEIVING) ||
-                    (context->state == MMI2C_STATE_RECEIVE_SETTLE)) {
-                    /* Do not generate STOP: the winning controller owns bus. */
-                    schedule_retry(context, true);
-                }
-                break;
+        case DL_I2C_IIDX_CONTROLLER_RX_DONE:
+            handle_rx_done(context);
+            break;
 
-            case DL_I2C_IIDX_CONTROLLER_NACK:
-                if ((context->state == MMI2C_STATE_TRANSMITTING) ||
-                    (context->state == MMI2C_STATE_RECEIVING) ||
-                    (context->state == MMI2C_STATE_RECEIVE_SETTLE)) {
-                    /* Unlike arbitration loss, this controller still owns the
-                     * transaction. Ensure a combined transfer whose TX phase
-                     * disabled STOP releases the bus after a NACK. */
-                    DL_I2C_enableStopCondition(context->regs);
-                    schedule_retry(context, false);
-                }
-                break;
+        case DL_I2C_IIDX_CONTROLLER_START:
+            handle_start(context);
+            break;
 
-            case DL_I2C_IIDX_CONTROLLER_STOP:
-                /* ARBLST is cleared by hardware when this STOP is observed. */
-                break;
+        case DL_I2C_IIDX_CONTROLLER_STOP:
+            handle_stop(context);
+            break;
 
-            case DL_I2C_IIDX_CONTROLLER_TXFIFO_EMPTY:
-            case DL_I2C_IIDX_CONTROLLER_START:
-            case DL_I2C_IIDX_CONTROLLER_EVENT1_DMA_DONE:
-            case DL_I2C_IIDX_CONTROLLER_EVENT2_DMA_DONE:
-            case DL_I2C_IIDX_CONTROLLER_PEC_RX_ERROR:
-            case DL_I2C_IIDX_TIMEOUT_A:
-            case DL_I2C_IIDX_TIMEOUT_B:
-            case DL_I2C_IIDX_TARGET_RX_DONE:
-            case DL_I2C_IIDX_TARGET_TX_DONE:
-            case DL_I2C_IIDX_TARGET_RXFIFO_TRIGGER:
-            case DL_I2C_IIDX_TARGET_TXFIFO_TRIGGER:
-            case DL_I2C_IIDX_TARGET_RXFIFO_FULL:
-            case DL_I2C_IIDX_TARGET_TXFIFO_EMPTY:
-            case DL_I2C_IIDX_TARGET_START:
-            case DL_I2C_IIDX_TARGET_STOP:
-            case DL_I2C_IIDX_TARGET_GENERAL_CALL:
-            case DL_I2C_IIDX_TARGET_EVENT1_DMA_DONE:
-            case DL_I2C_IIDX_TARGET_EVENT2_DMA_DONE:
-            case DL_I2C_IIDX_TARGET_PEC_RX_ERROR:
-            case DL_I2C_IIDX_TARGET_TXFIFO_UNDERFLOW:
-            case DL_I2C_IIDX_TARGET_RXFIFO_OVERFLOW:
-            case DL_I2C_IIDX_TARGET_ARBITRATION_LOST:
-            case DL_I2C_IIDX_INTERRUPT_OVERFLOW:
-            case DL_I2C_IIDX_NO_INT:
-            default:
-                break;
-        }
-    } while (source != DL_I2C_IIDX_NO_INT);
+        case DL_I2C_IIDX_CONTROLLER_ARBITRATION_LOST:
+            handle_arbitration_lost(context);
+            break;
+
+        case DL_I2C_IIDX_CONTROLLER_NACK:
+            handle_nack(context);
+            break;
+
+        case DL_I2C_IIDX_NO_INT:
+        default:
+            break;
+    }
 }
 
 mmi2c_result_t mmi2c_get_result(const mmi2c_t *context)
@@ -461,10 +579,7 @@ mmi2c_result_t mmi2c_release_bridge(mmi2c_t *context)
     if (!context->bridge_acquired) {
         return MMI2C_RESULT_OK;
     }
-
-    uint32_t status = DL_I2C_getControllerStatus(context->regs);
-    if (((status & DL_I2C_CONTROLLER_STATUS_BUSY_BUS) != 0u) ||
-        ((status & DL_I2C_CONTROLLER_STATUS_IDLE) == 0u)) {
+    if (!bus_is_available(context)) {
         return MMI2C_RESULT_BUSY;
     }
 

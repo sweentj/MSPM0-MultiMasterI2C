@@ -35,12 +35,17 @@ typedef enum {
 
 typedef enum {
     MMI2C_STATE_UNINITIALIZED = 0,
+    /* No transfer is queued. */
     MMI2C_STATE_IDLE,
+    /* A transfer is queued, but another controller may own the bus. */
     MMI2C_STATE_WAITING_FOR_BUS,
     MMI2C_STATE_TRANSMITTING,
     MMI2C_STATE_RECEIVING,
+    /* Waiting for the MSPM0 RXDONE erratum delay. */
     MMI2C_STATE_RECEIVE_SETTLE,
+    /* Waiting for randomized retry time and the winning controller's STOP. */
     MMI2C_STATE_WAITING_TO_RETRY,
+    /* A terminal result is ready for mmi2c_take_result(). */
     MMI2C_STATE_COMPLETE
 } mmi2c_state_t;
 
@@ -70,8 +75,8 @@ typedef struct {
      * read. Must cover at least two I2C functional-clock cycles. */
     uint16_t rx_done_settle_us;
 
-    /* Arbitration retries use binary exponential randomized backoff. The
-     * seed must differ between modules (for example, derived from serial ID). */
+    /* Retries use binary exponential randomized backoff. The seed must differ
+     * between modules (for example, derived from serial ID). */
     uint32_t random_seed;
     uint16_t backoff_slot_us;
     uint8_t max_arbitration_retries;
@@ -93,12 +98,17 @@ typedef struct {
     I2C_Regs *regs;
     mmi2c_config_t config;
     mmi2c_transfer_t transfer;
+
+    /* State written by the main loop and I2C ISR. */
     volatile mmi2c_state_t state;
     volatile mmi2c_result_t result;
     volatile uint16_t tx_count;
     volatile uint16_t rx_count;
     volatile uint8_t arbitration_retries;
     volatile uint8_t nack_retries;
+    volatile bool bus_locked;
+
+    /* Timing and bridge state used by mmi2c_process(). */
     uint32_t deadline_us;
     uint32_t retry_at_us;
     uint32_t prng;
@@ -126,7 +136,10 @@ mmi2c_result_t mmi2c_submit(
 /** Call regularly from the main loop or a timer tick to handle waits/timeouts. */
 void mmi2c_process(mmi2c_t *context);
 
-/** Call from the selected I2C peripheral's IRQ handler. */
+/**
+ * Call from the selected I2C peripheral's IRQ handler. It handles one pending
+ * I2C event and returns; it contains no interrupt-draining loop.
+ */
 void mmi2c_handle_irq(mmi2c_t *context);
 
 /** Returns the current result without changing it. */

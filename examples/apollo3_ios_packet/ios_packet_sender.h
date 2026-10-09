@@ -51,6 +51,15 @@ typedef enum {
     IOS_PACKET_SENDER_RELEASE_BRIDGE
 } ios_packet_sender_state_t;
 
+typedef enum {
+    IOS_PACKET_ERROR_NONE = 0,
+    IOS_PACKET_ERROR_SENSOR_READ,
+    IOS_PACKET_ERROR_PAYLOAD_LENGTH,
+    IOS_PACKET_ERROR_SERIALIZATION,
+    IOS_PACKET_ERROR_I2C,
+    IOS_PACKET_ERROR_BRIDGE_RELEASE
+} ios_packet_sender_error_t;
+
 typedef struct {
     mmi2c_t *i2c;
     ios_sensor_read_fn sensor_read;
@@ -80,6 +89,7 @@ typedef struct {
     uint32_t retry_at_us;
     bool release_is_success;
     mmi2c_result_t last_i2c_result;
+    ios_packet_sender_error_t last_error;
 
     uint32_t packets_completed;
     uint32_t packets_failed;

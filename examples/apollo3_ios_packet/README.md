@@ -43,6 +43,15 @@ following guarantees on the MSPM0 side:
 
 - ISR code only queues a request; sensor access and I2C submission occur in the
   main loop.
+- One call drains every immediate state transition. In particular, accepting a
+  request, reading the sensor, serializing the packet, and submitting its first
+  I2C chunk do not depend on a later SysTick or other unrelated interrupt.
+  Processing returns only when it reaches an I2C wait, retry deadline, bridge
+  release wait, an empty request queue, or a preparation failure.
+- The request counter's critical section restores the previous PRIMASK before
+  sensor acquisition. A sensor, payload-length, or serialization failure is
+  recorded in `last_error` and returns explicitly to `IDLE`, so later and
+  already-queued button/timer requests continue to run.
 - The byte offset advances only after the relevant I2C transaction completes
   with `MMI2C_RESULT_OK`.
 - A failed chunk is resent from the same offset, with up to three retries after
@@ -51,8 +60,9 @@ following guarantees on the MSPM0 side:
 - The trigger register is never written until all data chunks succeed.
 - The sequence number advances only after the trigger write succeeds and the
   bridge is safely released.
-- `packets_completed`, `packets_failed`, `last_i2c_result`, retry state, and
-  dropped request counts are retained for debugger/telemetry inspection.
+- `packets_completed`, `packets_failed`, `last_error`, `last_i2c_result`, retry
+  state, and dropped request counts are retained for debugger/telemetry
+  inspection.
 
 An I2C ACK proves that the Apollo3 IOS peripheral accepted each byte; it does
 not prove that Apollo3 firmware consumed the packet. Strict end-to-end delivery

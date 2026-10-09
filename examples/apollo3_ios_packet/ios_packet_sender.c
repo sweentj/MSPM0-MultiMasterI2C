@@ -2,7 +2,12 @@
 
 #include <string.h>
 
-#define IOS_DATA_BYTES_PER_TRANSFER (MMI2C_MAX_MESSAGE_BYTES - 1u)
+#define IOS_TRANSFER_MAX_BYTES      (8u)
+#define IOS_DATA_BYTES_PER_TRANSFER (IOS_TRANSFER_MAX_BYTES - 1u)
+
+#if (MMI2C_MAX_MESSAGE_BYTES < IOS_TRANSFER_MAX_BYTES)
+#error "The packet sender requires eight-byte I2C transfers"
+#endif
 
 size_t packet_serialize(
     const packet_t *packet, uint8_t *output, size_t output_capacity)
@@ -28,7 +33,7 @@ size_t packet_serialize(
 
 bool ios_packet_sender_init(ios_packet_sender_t *sender, mmi2c_t *i2c,
     uint8_t ios_address, uint8_t module_id, uint8_t message_type,
-    ios_sensor_read_fn sensor_read, void *user, uint8_t max_write_retries)
+    ios_sensor_read_fn sensor_read, void *user)
 {
     if ((sender == NULL) || (i2c == NULL) || (ios_address > 0x7Fu) ||
         (sensor_read == NULL)) {
@@ -36,87 +41,33 @@ bool ios_packet_sender_init(ios_packet_sender_t *sender, mmi2c_t *i2c,
     }
 
     (void) memset(sender, 0, sizeof(*sender));
-    sender->i2c               = i2c;
-    sender->sensor_read       = sensor_read;
-    sender->user              = user;
-    sender->ios_address       = ios_address;
-    sender->module_id         = module_id;
-    sender->message_type      = message_type;
-    sender->max_write_retries = max_write_retries;
-    sender->last_i2c_result   = MMI2C_RESULT_NONE;
-    sender->last_error        = IOS_PACKET_ERROR_NONE;
-    return true;
+    sender->i2c = i2c;
+    sender->sensor_read = sensor_read;
+    sender->user = user;
+    sender->ios_address = ios_address;
+    sender->module_id = module_id;
+    sender->message_type = message_type;
+    sender->last_i2c_result = MMI2C_RESULT_OK;
+    sender->request_queue = xQueueCreateStatic(1u, sizeof(uint8_t),
+        sender->request_queue_buffer, &sender->request_queue_storage);
+    return sender->request_queue != NULL;
 }
 
-/* Wait for the interrupt-driven I2C transfer to finish. Timeouts and
- * arbitration backoff are checked by mmi2c_process() in this polling loop. */
-static mmi2c_result_t wait_for_i2c(mmi2c_t *i2c)
+static mmi2c_result_t write_ios(ios_packet_sender_t *sender,
+    uint8_t ios_register, const uint8_t *data, uint8_t length)
 {
-    while (mmi2c_get_result(i2c) == MMI2C_RESULT_IN_PROGRESS) {
-        mmi2c_process(i2c);
-    }
-    return mmi2c_take_result(i2c);
-}
+    uint8_t frame[IOS_TRANSFER_MAX_BYTES];
+    frame[0] = APOLLO3_IOS_WRITE_COMMAND_BIT | ios_register;
+    (void) memcpy(&frame[1], data, length);
 
-static mmi2c_result_t write_i2c(ios_packet_sender_t *sender,
-    const uint8_t *data, uint16_t length)
-{
     mmi2c_transfer_t transfer = {
-        .address   = sender->ios_address,
-        .tx_data   = data,
-        .rx_data   = NULL,
-        .tx_length = length,
+        .address = sender->ios_address,
+        .tx_data = frame,
+        .rx_data = NULL,
+        .tx_length = (uint16_t) length + 1u,
         .rx_length = 0u,
     };
-
-    /* One initial attempt, followed by max_write_retries retries. */
-    uint16_t attempts = (uint16_t) sender->max_write_retries + 1u;
-    for (uint16_t attempt = 0u; attempt < attempts; ++attempt) {
-        mmi2c_result_t result = mmi2c_submit(sender->i2c, &transfer);
-
-        if (result == MMI2C_RESULT_IN_PROGRESS) {
-            result = wait_for_i2c(sender->i2c);
-        } else if (result == MMI2C_RESULT_BRIDGE_NOT_READY) {
-            /* mmi2c_submit() can finish immediately, for example when the
-             * bridge cannot be enabled. Take that result to return to IDLE. */
-            result = mmi2c_take_result(sender->i2c);
-        }
-
-        if (result == MMI2C_RESULT_OK) {
-            return result;
-        }
-
-        sender->last_i2c_result = result;
-        if ((attempt + 1u) == attempts) {
-            return result;
-        }
-    }
-
-    return MMI2C_RESULT_INVALID_ARGUMENT;
-}
-
-static bool release_bridge(ios_packet_sender_t *sender)
-{
-    uint32_t started_at =
-        sender->i2c->config.now_us(sender->i2c->config.user);
-    mmi2c_result_t result;
-    do {
-        mmi2c_process(sender->i2c);
-        result = mmi2c_release_bridge(sender->i2c);
-        if ((result == MMI2C_RESULT_BUSY) &&
-            ((uint32_t) (sender->i2c->config.now_us(
-                sender->i2c->config.user) - started_at) >=
-                sender->i2c->config.bus_idle_timeout_us)) {
-            result = MMI2C_RESULT_BUS_BUSY_TIMEOUT;
-        }
-    } while (result == MMI2C_RESULT_BUSY);
-
-    if (result != MMI2C_RESULT_OK) {
-        sender->last_i2c_result = result;
-        sender->last_error = IOS_PACKET_ERROR_BRIDGE_RELEASE;
-        return false;
-    }
-    return true;
+    return mmi2c_transfer(sender->i2c, &transfer);
 }
 
 static bool fail(ios_packet_sender_t *sender,
@@ -129,7 +80,9 @@ static bool fail(ios_packet_sender_t *sender,
 
 static bool fail_i2c_and_release(ios_packet_sender_t *sender)
 {
-    if (!release_bridge(sender)) {
+    mmi2c_result_t release_result = mmi2c_release_bridge(sender->i2c);
+    if (release_result != MMI2C_RESULT_OK) {
+        sender->last_i2c_result = release_result;
         return fail(sender, IOS_PACKET_ERROR_BRIDGE_RELEASE);
     }
     return fail(sender, IOS_PACKET_ERROR_I2C);
@@ -143,11 +96,12 @@ bool ios_packet_sender_send(ios_packet_sender_t *sender)
     }
 
     packet_t packet = {
-        .module_id       = sender->module_id,
-        .message_type    = sender->message_type,
+        .module_id = sender->module_id,
+        .message_type = sender->message_type,
         .sequence_number = sender->next_sequence_number,
-        .payload_len     = 0u,
+        .payload_len = 0u,
     };
+    sender->last_i2c_result = MMI2C_RESULT_OK;
 
     if (!sender->sensor_read(packet.payload, MAX_PAYLOAD_LEN,
             &packet.payload_len, sender->user)) {
@@ -165,46 +119,73 @@ bool ios_packet_sender_send(ios_packet_sender_t *sender)
     }
 
     sender->last_error = IOS_PACKET_ERROR_NONE;
-    sender->last_i2c_result = MMI2C_RESULT_IN_PROGRESS;
-
-    /* Write the packet into IOS LRAM, starting at register 0x50. */
     size_t bytes_sent = 0u;
+
     while (bytes_sent < tx_length) {
         size_t chunk_length = tx_length - bytes_sent;
         if (chunk_length > IOS_DATA_BYTES_PER_TRANSFER) {
             chunk_length = IOS_DATA_BYTES_PER_TRANSFER;
         }
 
-        uint8_t frame[MMI2C_MAX_MESSAGE_BYTES];
-        frame[0] = APOLLO3_IOS_WRITE_COMMAND_BIT |
-                   (uint8_t) (APOLLO3_IOS_DATA_REGISTER + bytes_sent);
-        (void) memcpy(&frame[1], &tx_data[bytes_sent], chunk_length);
-
-        mmi2c_result_t result =
-            write_i2c(sender, frame, (uint16_t) chunk_length + 1u);
-        if (result != MMI2C_RESULT_OK) {
+        sender->last_i2c_result = write_ios(sender,
+            (uint8_t) (APOLLO3_IOS_DATA_REGISTER + bytes_sent),
+            &tx_data[bytes_sent], (uint8_t) chunk_length);
+        if (sender->last_i2c_result != MMI2C_RESULT_OK) {
             return fail_i2c_and_release(sender);
         }
         bytes_sent += chunk_length;
     }
 
-    /* All packet bytes succeeded. Tell the Apollo3 that the packet is ready. */
-    const uint8_t trigger[] = {
-        APOLLO3_IOS_WRITE_COMMAND_BIT | APOLLO3_IOS_TRIGGER_REGISTER,
-        APOLLO3_IOS_TRIGGER_VALUE,
-    };
-    mmi2c_result_t result = write_i2c(sender, trigger, sizeof(trigger));
-    if (result != MMI2C_RESULT_OK) {
+    const uint8_t trigger = APOLLO3_IOS_TRIGGER_VALUE;
+    sender->last_i2c_result = write_ios(sender,
+        APOLLO3_IOS_TRIGGER_REGISTER, &trigger, 1u);
+    if (sender->last_i2c_result != MMI2C_RESULT_OK) {
         return fail_i2c_and_release(sender);
     }
 
-    if (!release_bridge(sender)) {
+    sender->last_i2c_result = mmi2c_release_bridge(sender->i2c);
+    if (sender->last_i2c_result != MMI2C_RESULT_OK) {
         return fail(sender, IOS_PACKET_ERROR_BRIDGE_RELEASE);
     }
 
-    sender->last_i2c_result = MMI2C_RESULT_OK;
     sender->last_error = IOS_PACKET_ERROR_NONE;
     ++sender->next_sequence_number;
     ++sender->packets_completed;
     return true;
+}
+
+void ios_packet_sender_task(void *argument)
+{
+    ios_packet_sender_t *sender = argument;
+    uint8_t request;
+
+    for (;;) {
+        if (xQueueReceive(sender->request_queue, &request,
+                portMAX_DELAY) == pdTRUE) {
+            (void) ios_packet_sender_send(sender);
+        }
+    }
+}
+
+void ios_packet_sender_request(ios_packet_sender_t *sender)
+{
+    if ((sender == NULL) || (sender->request_queue == NULL)) {
+        return;
+    }
+
+    const uint8_t request = 1u;
+    (void) xQueueOverwrite(sender->request_queue, &request);
+}
+
+void ios_packet_sender_request_from_isr(ios_packet_sender_t *sender)
+{
+    if ((sender == NULL) || (sender->request_queue == NULL)) {
+        return;
+    }
+
+    const uint8_t request = 1u;
+    BaseType_t higher_priority_task_woken = pdFALSE;
+    (void) xQueueOverwriteFromISR(sender->request_queue, &request,
+        &higher_priority_task_woken);
+    portYIELD_FROM_ISR(higher_priority_task_woken);
 }

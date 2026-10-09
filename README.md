@@ -1,272 +1,182 @@
-# MSPM0 multi-controller I2C library
+# MSPM0 FreeRTOS multi-controller I2C
 
-This is a small, allocation-free, interrupt-driven controller library for the
-MSPM0 I2C peripheral. It supplies the transaction and retry behavior missing
-from TI's higher-level I2C driver while using TI DriverLib as the portable
-register layer. It compiles for both MSPM0G3519 and MSPM0L1116.
+A small FreeRTOS/DriverLib I2C controller library for MSPM0G and MSPM0L
+devices. The public transfer API is synchronous and thread-safe:
 
-It supports:
+```c
+mmi2c_result_t result = mmi2c_transfer(&i2c, &transfer);
+```
 
-- multiple I2C controllers on one bus;
-- arbitration-loss detection and the recovery sequence required by the MSPM0
-  technical reference manual;
-- randomized binary exponential retry backoff;
-- write, read, and write/repeated-START/read transactions with an eight-byte
-  total message limit;
-- NACK, bus-idle, and transfer timeouts;
-- optional PCA9615 power/enable hooks;
-- an optional board-specific stuck-bus recovery hook; and
-- operation without an RTOS or dynamic allocation.
+The calling task sleeps while the hardware is busy. The I2C ISR handles one
+IIDX event, records the result, and wakes that task with a direct task
+notification. There is no application polling function or I2C state machine to
+advance from a timer tick.
 
-## Important terminology
+## What it supports
 
-Recent I2C specifications use **controller/target**. Older material uses
-**master/slave**. "Multi-controller" here is the same electrical behavior as
-"multi-master".
+- Multiple controllers sharing a 400 kHz bus.
+- Write, read, and write/repeated-START/read transactions.
+- Eight total data bytes per transaction by default.
+- A FreeRTOS mutex around each hardware instance.
+- Bus-idle and transfer timeouts expressed in FreeRTOS ticks.
+- Randomized arbitration-loss retries.
+- Optional NACK retries.
+- Optional PCA9615 VDD(B)/EN callbacks.
+- Optional stuck-bus recovery callback.
+- Static FreeRTOS allocation only.
 
-## Assumptions
+## Public API
 
-1. MSPM0 SDK 2.11.00.07 (or a DriverLib version with the same I2C API) is used.
-2. SysConfig initializes the I2C clock, pins, FIFO thresholds, and controller.
-   This library does not own the pin mux or system clock.
-3. Addresses passed to the API are unshifted 7-bit addresses. Ten-bit
-   addressing is intentionally rejected.
-4. Every controller uses open-drain-compatible I2C pins and the single-ended
-   side of each PCA9615 has suitable pull-ups. No device actively drives either
-   bus line high.
-5. The bus is configured for 400 kHz Fast-mode operation, with at most six
-   MSPM0 controllers connected through PCA9615 buffers.
-6. `now_us()` is monotonic modulo 2^32 and is safe to call in an ISR. Configured
-   timeouts must be less than 2^31 microseconds.
-   `rx_done_settle_us` must span at least two clocks of the configured I2C
-   functional clock; 2 us is conservative when that clock is at least 1 MHz.
-7. The application calls `mmi2c_process()` often enough to enforce its timeout
-   requirements, including while waiting for another controller to finish.
-8. The selected I2C IRQ is enabled in the NVIC, and its ISR calls
-   `mmi2c_handle_irq()`.
-9. A transfer's buffers stay allocated and unchanged until
-   `mmi2c_take_result()` returns its terminal result.
-10. There is one `mmi2c_t` context per I2C hardware instance. API calls that
-    mutate a context are made from one application execution context. The I2C
-    ISR may run concurrently as designed; do not submit from the ISR.
-11. A complete API transaction contains at most 64 data bits: `tx_length +
-    rx_length <= 8`. The address, START, ACK/NACK, and STOP bits are not counted
-    in that limit. Override `MMI2C_MAX_MESSAGE_BYTES` at compile time only if
-    this product constraint changes.
-12. PCA9615 VDD(B) and EN are controlled separately. The library's
-    `bridge_acquire()` callback owns their sequencing; the I2C state machine
-    never manipulates board GPIOs directly.
-13. Bus recovery is not attempted after ordinary arbitration loss. Recovery is
-    only considered after the entire bus-idle timeout, because clocking a bus
-    that another valid controller owns would corrupt its transaction.
+There are four calls:
 
-## SysConfig setup
+```c
+mmi2c_init(&i2c, I2C_0_INST, &config);
+mmi2c_transfer(&i2c, &transfer);
+mmi2c_release_bridge(&i2c);
+mmi2c_handle_irq(&i2c);
+```
 
-For the chosen I2C instance:
+`mmi2c_transfer()` blocks only the calling task. Other tasks continue to run.
+The internal mutex allows several tasks to share one I2C instance safely.
 
-1. Configure it as a controller at 400 kHz.
-2. Enable the controller peripheral and configure SDA/SCL pins.
-3. Select TX and RX FIFO thresholds of one byte. Each RX FIFO interrupt removes
-   at most one byte; if more bytes remain, the peripheral requests another
-   interrupt.
-4. Do not enable DMA for the same I2C instance.
-5. Let SysConfig generate `ti_msp_dl_config.c/.h`.
-6. Add `include/mmi2c.h` and `src/mmi2c.c` to the project.
-7. Call `mmi2c_init()` after `SYSCFG_DL_init()`, then enable the instance's NVIC
-   interrupt.
+When one logical message requires several I2C transactions, set
+`release_bridge_after_transfer = false`, perform the transfers, then call
+`mmi2c_release_bridge()`. The Apollo3 packet example uses this to keep the
+PCA9615 powered across two data writes and the trigger write.
 
-`mmi2c_init()` explicitly sets `MCR.MMST`, which makes the SCL high-period timer
-start only after SCL is actually observed high. It also enables RX/TX done,
-FIFO, NACK, START, STOP, and arbitration-loss peripheral interrupts.
+## Multi-controller behavior
 
-The implementation also accounts for current G351x and L111x I2C errata:
+Bus ownership is deliberately simple:
 
-- I2C_ERR_07: each transfer START is programmed with one complete MCTR update;
-- I2C_ERR_08: the final RX FIFO read is deferred for the configured interval,
-  which must be at least two I2C functional-clock cycles;
-- I2C_ERR_13: completion uses peripheral interrupts rather than immediately
-  polling BUSY after BURSTRUN; and
-- I2C_ERR_05: the library never toggles controller ACTIVE during a transfer.
+- A START observed while this MCU is not transferring locks the bus.
+- Arbitration loss locks the bus and wakes the calling task with
+  `MMI2C_RESULT_ARBITRATION_LOST`.
+- The losing controller never generates STOP.
+- STOP unlocks the bus unless hardware already reports a new transaction.
+- Every new attempt requires both the software lock to be clear and the
+  MSPM0 peripheral to report IDLE and bus-not-busy.
 
-## Minimal integration
+After arbitration loss, the task waits for STOP, sleeps for a randomized
+binary-exponential backoff, and retries the complete transaction. No retry
+delay occurs in the ISR.
 
-See `examples/lp_mspm0g3519_example.c`. The essential ISR is:
+The hardware BUSBSY check remains necessary because a newly connected PCA9615
+can join a transaction after its START has already occurred.
+
+## Interrupt handler
 
 ```c
 void I2C_0_INST_IRQHandler(void)
 {
-    mmi2c_handle_irq(&g_i2c);
+    mmi2c_handle_irq(&i2c);
 }
 ```
 
-The application submits a transfer and continues to call `mmi2c_process()`:
+`mmi2c_handle_irq()` reads IIDX once and returns. It contains no interrupt
+draining loop. TX and RX FIFO service each moves one byte. The final RX FIFO
+drain for MSPM0 I2C_ERR_08 runs in task context after
+`rx_settle_ticks`.
+
+Because the ISR calls `vTaskNotifyGiveFromISR()`, configure its NVIC priority as
+a FreeRTOS system-call-safe interrupt priority. The library temporarily uses
+notification index zero of the task calling `mmi2c_transfer()`; that task must
+not use the same notification concurrently.
+
+## Minimal configuration
 
 ```c
-mmi2c_transfer_t transfer = {
-    .address = TARGET_ADDRESS,
-    .tx_data = packet,
-    .tx_length = packet_length,
+static const mmi2c_config_t config = {
+    .bridge_acquire = bridge_acquire,
+    .bridge_release = bridge_release,
+    .mutex_timeout_ticks = pdMS_TO_TICKS(100) + 1,
+    .bus_timeout_ticks = pdMS_TO_TICKS(10) + 1,
+    .transfer_timeout_ticks = pdMS_TO_TICKS(5) + 1,
+    .backoff_slot_ticks = pdMS_TO_TICKS(1) + 1,
+    .rx_settle_ticks = 2,
+    .random_seed = UNIQUE_MODULE_SEED,
+    .max_arbitration_retries = 8,
+    .max_nack_retries = 0,
+    .release_bridge_after_transfer = true,
 };
-
-if (mmi2c_submit(&g_i2c, &transfer) == MMI2C_RESULT_IN_PROGRESS) {
-    /* Continue the application; IRQs move the bytes. */
-}
 ```
 
-When the result stops being `MMI2C_RESULT_IN_PROGRESS`, consume it with
-`mmi2c_take_result()`. A completed context deliberately remains unavailable
-until the result is taken so an error cannot be silently overwritten.
+The extra tick guarantees a nonzero delay even when the configured tick rate
+cannot represent one millisecond exactly.
 
-For a complete bare-metal packet application using button/timer requests,
-chunked Apollo3 IOS direct-area writes, bounded retries, and one PCA9615 power
-cycle per packet, see `examples/apollo3_ios_packet/README.md`.
+Each module needs a different nonzero `random_seed`, preferably derived from a
+factory identifier. Identical seeds and synchronized activation can produce
+repeated collisions.
 
-## Arbitration behavior
+## Project setup
 
-The library uses one explicit `bus_locked` flag:
+Start from TI's `empty_freertos` example for the selected MSPM0 device, then
+add:
 
-- A START detected while this controller has not started a transaction locks
-  the bus.
-- Arbitration loss locks the bus and flushes this controller's FIFOs. It does
-  not generate STOP because the winning controller owns the transaction.
-- STOP clears the lock, unless hardware already reports another transaction in
-  progress.
-- A new transfer starts only when the software lock is clear and hardware
-  reports both controller IDLE and bus-not-busy.
+- `include/mmi2c.h`
+- `src/mmi2c.c`
+- the application files that use the library
 
-The hardware BUSBSY check is still required. If this MCU connects or enables
-its controller halfway through another controller's transaction, it may not
-have observed that transaction's START interrupt.
+FreeRTOS must enable:
 
-The START interrupt does not identify which controller generated it. The
-library treats it as its own only while its state is `TRANSMITTING` or
-`RECEIVING`; in every other state it is treated as an external START.
+```c
+#define configSUPPORT_STATIC_ALLOCATION 1
+#define configUSE_MUTEXES               1
+#define configUSE_TASK_NOTIFICATIONS    1
+```
 
-After arbitration loss, the complete application transfer is retried:
+SysConfig must configure the selected I2C instance as a 400 kHz controller,
+with TX/RX FIFO thresholds of one byte and DMA disabled. Enable the peripheral
+IRQ from a task after the scheduler has started. This prevents an early IRQ
+from calling a FreeRTOS `FromISR` API before the kernel is running.
 
-1. mask the TX FIFO trigger and TX-empty sources;
-2. clear those pending interrupt flags;
-3. flush the TX FIFO;
-4. do **not** generate STOP, because the winning controller owns the bus;
-5. wait for the winner's STOP, the software bus lock to clear, and hardware
-   BUSBSY/ARBLST to clear;
-6. wait a randomized backoff; and
-7. refill the FIFO and retry the complete application transaction.
+The library is intended for FreeRTOS 11.2.0 supplied with MSPM0 SDK 2.11.00.07.
+It uses standard FreeRTOS queue, mutex, task-delay, timeout, and direct-task-
+notification APIs.
 
-Use a different nonzero `random_seed` on every module. A stable hash of a
-factory serial number is suitable. Identical seeds and identical activation
-timing can cause repeated collisions. Initialization rejects a zero seed or a
-zero backoff slot when arbitration retries are enabled.
+The repository Makefile provides compile-only checks when GNU Arm Embedded is
+on `PATH`:
 
-NACK retries default to zero in the example. NACK is usually a protocol or
-target-readiness problem, not contention, so retrying it automatically can hide
-a fault. Arbitration loss is the only condition that normally merits automatic
-retry.
+```sh
+make check-example-g3519 SDK=/path/to/mspm0-sdk
+make check-example-l1116 SDK=/path/to/mspm0-sdk
+```
 
-## Interrupt behavior
+## PCA9615 power control
 
-`mmi2c_handle_irq()` reads IIDX once, handles that one event, and returns. There
-is no interrupt-draining loop. Reading IIDX clears the selected event; if
-another event remains pending, the MSPM0 asserts the IRQ again. RX FIFO events
-remove one byte per ISR invocation. The only FIFO-draining loop is in
-`mmi2c_process()` after the RXDONE settling delay, so it runs in main-loop
-context rather than interrupt context.
+`bridge_acquire()` runs in task context, so it may call `vTaskDelay()`:
 
-## Identical-transfer limitation
+1. Hold EN low.
+2. Switch VDD(B) on.
+3. Delay at least 11 ms; the example uses 12 ms plus tick-phase margin.
+4. Assert EN.
+5. Allow the bus-idle qualification interval.
 
-If two modules transmit the same target address and identical eight-byte data
-at the same instant, neither is guaranteed to observe arbitration loss because
-both are driving the same bit values. This is inherent I2C behavior rather than
-a library defect. Ensure concurrently transmitted data differs early, or handle
-the ambiguity above this library.
+`bridge_release()` must drive EN low before switching VDD(B) off. The library
+calls it only after the bus is idle. If the idle wait times out, the bridge is
+left powered rather than disconnecting an active transaction.
 
-## PCA9615 VDD(B) and EN sequencing
+## Assumptions and limits
 
-The PCA9615 hot-swap behavior must be treated separately from MSPM0 arbitration:
+- Seven-bit addresses only.
+- `tx_length + rx_length <= MMI2C_MAX_MESSAGE_BYTES` (eight by default).
+- Up to six controllers connected through correctly terminated PCA9615 links.
+- Transfer buffers remain valid until `mmi2c_transfer()` returns.
+- `mmi2c_transfer()` and `mmi2c_release_bridge()` are task-only APIs.
+- The optional recovery callback is called only after the full bus timeout.
+- Hardware validation is still required for hot-swap timing and simultaneous
+  controller behavior.
 
-- Begin with EN low, switch VDD(B) on, and wait at least 11 ms before asserting
-  EN. Using 12 ms provides modest timer and supply-ramp margin.
-- After EN is asserted, allow the PCA9615 bus-idle qualification interval. The
-  data sheet specifies 100 us for idle detection; 200 us is a conservative
-  software allowance when no STOP is observed.
-- EN high does not by itself guarantee immediate connection. Connection also
-  depends on a valid, terminated differential bus and an idle/STOP condition.
-- On shutdown, deassert EN before switching VDD(B) off.
+If two controllers transmit an identical address and identical data at the
+same time, neither is guaranteed to detect arbitration loss. That is inherent
+I2C behavior; make concurrently generated packets differ early.
 
-`bridge_acquire()` is intentionally synchronous and board-owned: it asserts
-power/EN and returns only when a transaction may safely start. If the device is
-kept powered and connected, omit both bridge callbacks.
-
-For this power-sensitive design, set `release_bridge_when_done = true`. Release
-is deferred until hardware
-reports both controller IDLE and bus-not-busy, so the PCA9615 cannot be
-disconnected before the transaction's STOP condition reaches the bus. Continue
-calling `mmi2c_process()` after observing a result; the normal main-loop pattern
-in the example already does this.
-
-For a batch made from several I2C transactions, set
-`release_bridge_when_done = false`, complete every transaction in the batch,
-then call `mmi2c_release_bridge()` until it returns `MMI2C_RESULT_OK`. This keeps
-VDD(B)/EN active between chunks without allowing the application to disconnect
-the PCA9615 during a transfer or before STOP has released the bus. The
-`apollo3_ios_packet` example uses this pattern.
-
-## Stuck-bus recovery
-
-The optional `bus_recover()` callback exists because generic recovery cannot
-safely change the SysConfig-owned I2C pins. A board implementation should:
-
-1. first establish that all other controllers have exceeded the agreed maximum
-   transaction duration;
-2. disconnect or disable the local PCA9615 if appropriate;
-3. temporarily mux the local single-ended pins to open-drain GPIO;
-4. clock SCL up to nine times while observing SDA;
-5. generate STOP only if the local segment can be controlled without disturbing
-   a valid differential transaction;
-6. restore the peripheral pin mux and I2C state; and
-7. return true only if both lines and the hardware BUSBSY indication recover.
-
-Do not enable this hook until the recovery policy has been validated with all
-module power-state combinations.
-
-## Bench validation plan
-
-Use the LP-MSPM0G3519 as one controller and at least one second controller. A
-target is also required; a logic analyzer should observe both single-ended and,
-if possible, differential sides.
-
-1. Verify one-module write, read, and combined write/read at 400 kHz using the
-   maximum eight-byte total transaction.
-2. Start two different module-ID packets on the same timer edge. Confirm exactly
-   one arbitration-lost interrupt, no STOP from the loser, and later retry.
-3. Sweep relative start time through at least one full byte at 400 kHz.
-4. Send identical prefixes and then differing module IDs. Confirm arbitration
-   occurs on the first differing `1` versus `0` bit.
-5. Repeat simultaneous-start testing with all six controllers and verify that
-   randomized backoff eventually completes every transfer.
-6. Send completely identical frames and document the expected inherent I2C
-   ambiguity.
-7. Hold the target in reset to test address NACK. Hold SCL low to test transfer
-   timeout. Hold SDA low while idle to test bus-idle timeout.
-8. Cycle each PCA9615 VDD(B) and EN independently and measure connection time
-   and current.
-9. Repeat collision tests while different module buffers are connecting.
-10. Run long-duration randomized traffic and track attempts, arbitration
-    losses, NACKs, and timeouts.
-
-## Current scope limits
-
-- No 10-bit addressing, SMBus PEC, DMA, RTOS locking, target mode, or General
-  Call support.
-- The library does not configure clocks, pins, NVIC priority, or PCA9615 GPIOs.
-- Hardware bench validation is still required. Compilation alone cannot prove
-  behavior through the PCA9615 hot-swap state machine.
+See [the packet example](examples/apollo3_ios_packet/README.md) for the complete
+FreeRTOS sensor-to-Apollo3 flow.
 
 ## Primary references
 
-- Texas Instruments, MSPM0 G-Series 80-MHz Microcontrollers Technical Reference
-  Manual, I2C arbitration and multiple-controller sections (SLAU846).
-- Texas Instruments, MSPM0 SDK DriverLib `dl_i2c.h` and the
-  `i2c_multicontroller_arbitration` example.
-- NXP, PCA9615 data sheet, hot-swap/power-on sequence and timing (Rev. 2,
-  16 September 2021).
+- [MSPM0 G-Series technical reference manual](https://www.ti.com/lit/pdf/slau846)
+- [MSPM0 L-Series technical reference manual](https://www.ti.com/lit/pdf/slau847)
+- [MSPM0 SDK examples guide](https://software-dl.ti.com/msp430/esd/MSPM0-SDK/latest/docs/english/sdk_users_guide/doc_guide/doc_guide-srcs/examples_guide.html)
+- [FreeRTOS task notifications](https://www.freertos.org/Documentation/02-Kernel/02-Kernel-features/03-Direct-to-task-notifications/01-Task-notifications)
+- NXP PCA9615 data sheet, Rev. 2

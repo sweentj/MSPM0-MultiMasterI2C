@@ -19,18 +19,15 @@
 #define APP_BRIDGE_VDDB_PORT         GPIO_BRIDGE_PORT
 #define APP_BRIDGE_VDDB_PIN          GPIO_BRIDGE_VDDB_PIN
 
-/* SysConfig name: TIMER_TIMEBASE. Configure TIMG8 as a 1 MHz, periodic,
- * 16-bit down counter with load value 0xFFFF. Do not enable its IRQ. */
-#define APP_TIMEBASE_INST             TIMER_TIMEBASE_INST
-
 #define APP_IOS_ADDRESS              (0x10u)
 #define APP_MODULE_ID                (0x01u)
 #define APP_MESSAGE_TYPE_SENSOR      (0x01u)
 
-#define APP_BRIDGE_POWER_SETTLE_US  (12000u)
-#define APP_BRIDGE_ENABLE_SETTLE_US (1000u)
-#define APP_BRIDGE_STARTUP_US                                        \
-    (APP_BRIDGE_POWER_SETTLE_US + APP_BRIDGE_ENABLE_SETTLE_US)
+#define APP_BRIDGE_POWER_SETTLE_MS  (12u)
+#define APP_BRIDGE_ENABLE_SETTLE_MS (1u)
+
+#define APP_SENDER_TASK_STACK_WORDS (256u)
+#define APP_SENDER_TASK_PRIORITY    (tskIDLE_PRIORITY + 2u)
 
 /* Replace with a nonzero value derived from a unique factory identifier. */
 #define APP_UNIQUE_RANDOM_SEED       (0x13579BDFu)

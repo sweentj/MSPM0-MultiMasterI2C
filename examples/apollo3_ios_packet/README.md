@@ -38,31 +38,41 @@ disconnected and powered down after the peripheral reports IDLE.
 
 ## Delivery mechanism
 
-`ios_packet_sender_process()` is a nonblocking state machine. It provides the
-following guarantees on the MSPM0 side:
+There is no packet-sender state machine and no SysTick handler.
+`ios_packet_sender_send()` performs one packet in this order:
 
-- ISR code only queues a request; sensor access and I2C submission occur in the
-  main loop.
-- One call drains every immediate state transition. In particular, accepting a
-  request, reading the sensor, serializing the packet, and submitting its first
-  I2C chunk do not depend on a later SysTick or other unrelated interrupt.
-  Processing returns only when it reaches an I2C wait, retry deadline, bridge
-  release wait, an empty request queue, or a preparation failure.
-- The request counter's critical section restores the previous PRIMASK before
-  sensor acquisition. A sensor, payload-length, or serialization failure is
-  recorded in `last_error` and returns explicitly to `IDLE`, so later and
-  already-queued button/timer requests continue to run.
-- The byte offset advances only after the relevant I2C transaction completes
-  with `MMI2C_RESULT_OK`.
-- A failed chunk is resent from the same offset, with up to three retries after
-  the initial attempt. Each attempt still has the lower library's independent
-  randomized arbitration-loss retries.
-- The trigger register is never written until all data chunks succeed.
-- The sequence number advances only after the trigger write succeeds and the
-  bridge is safely released.
-- `packets_completed`, `packets_failed`, `last_error`, `last_i2c_result`, retry
-  state, and dropped request counts are retained for debugger/telemetry
-  inspection.
+1. Read the sensor.
+2. Serialize the packet into a local `tx_data` array.
+3. Write each data chunk at `0x50 + bytes_sent`.
+4. Write `0x80` at `0x01` only after every data chunk succeeds.
+5. Disconnect and power down the PCA9615.
+
+The function is blocking and runs only in the main loop. The I2C peripheral
+still generates interrupts, and `APP_I2C_IRQHandler()` passes one event at a
+time to the multi-controller library. While waiting, the sender repeatedly
+calls `mmi2c_process()` so bus timeouts and randomized arbitration backoff do
+not need a periodic interrupt.
+
+The button ISR only sets `g_send_requested` and executes `__SEV()`. The main
+loop sleeps with `__WFE()` until that flag is set, then sends the entire packet
+sequentially. A product timer ISR can use the same two lines. Multiple request
+interrupts before the main loop handles the flag are intentionally coalesced
+into one request.
+
+The sender provides these guarantees:
+
+- A sensor-read or serialization failure returns directly to the main loop;
+  no interrupt state is changed by the sender.
+- The byte offset advances only after the corresponding I2C write returns
+  `MMI2C_RESULT_OK`.
+- A failed write is repeated at the same register, up to three times after the
+  initial attempt. The lower library separately handles arbitration loss with
+  randomized backoff.
+- The trigger register is never written until all data writes succeed.
+- The sequence number advances only after the trigger succeeds and the bridge
+  is safely released.
+- `packets_completed`, `packets_failed`, `sensor_read_failures`, `last_error`,
+  and `last_i2c_result` remain available for debugger or telemetry inspection.
 
 An I2C ACK proves that the Apollo3 IOS peripheral accepted each byte; it does
 not prove that Apollo3 firmware consumed the packet. Strict end-to-end delivery
@@ -93,8 +103,8 @@ register or format was specified.
    simultaneously active modules.
 8. Multi-byte sensor fields in the sample payload are little-endian. The four
    packet header fields are single bytes and have no endianness issue.
-9. Button debounce is implemented in hardware or in the product's input layer;
-   every interrupt in this example queues one sample request.
+9. Button debounce is implemented in hardware or in the product's input layer.
+   Requests that arrive before an earlier request is taken are coalesced.
 
 ## MSPM0 SysConfig setup
 
@@ -109,17 +119,25 @@ Configure these SysConfig components:
   a pull-up.
 - `GPIO_BRIDGE`: two initially-low outputs named `EN` and `VDDB`. `VDDB` drives
   the external power-switch control, not the PCA9615 EN pin.
+- `TIMER_TIMEBASE`: use TIMG8 as a periodic 16-bit down counter clocked at
+  exactly 1 MHz, with load value `0xFFFF`. Enable "start timer", but do not
+  enable any timer interrupt. TIMG8 is available on both target device series.
 
 The aliases in `app_config.h` follow those component names. Adjust that one
 file if SysConfig generates different symbols or assigns a different GPIO
 group IRQ handler. Set the application I2C address, module ID, message type,
-sample period, and unique random seed there as well.
+bridge delays, and unique random seed there as well.
 
-The example uses a 1 ms SysTick for clarity. This quantizes timeouts/backoff to
-1 ms and wakes the MCU periodically. For production low-power firmware,
-replace `app_now_us()` and the periodic request source with a continuously
-running low-power timer or RTC/alarm arrangement while preserving a monotonic
-microsecond-compatible counter.
+`TIMER_TIMEBASE` is polled; it never wakes the CPU. `app_now_us()` extends its
+16-bit count in software. During a send it is called continuously, so the
+65.536 ms wrap cannot be missed. While the device is idle, missed whole wraps
+do not matter because no deadline is active; this timebase is for relative
+delays and timeouts, not wall-clock timestamps. If the product already has a
+monotonic microsecond counter, `app_now_us()` can use that instead.
+
+For periodic sampling, configure a separate low-power timer or RTC alarm. Its
+ISR should clear its interrupt flag, set `g_send_requested = true`, and call
+`__SEV()`. It must not call `ios_packet_sender_send()` itself.
 
 `sensor_stub.c` emits two deterministic 16-bit values. Replace
 `sensor_read_payload()` with the real sensor driver; the callback runs in the
@@ -131,8 +149,8 @@ main loop and must return a payload length no greater than four.
    instruction sequence for a four-byte payload.
 2. Force a NACK during each phase and confirm that the exact failed phase is
    retried, without incrementing `bytes_sent` or the sequence number.
-3. Start two modules together and confirm arbitration loss is handled within
-   the multi-controller library before the application retry counter changes.
+3. Start two modules together and confirm arbitration loss is retried with a
+   randomized delay by the multi-controller library.
 4. Confirm EN goes high only after VDD(B) has been on for at least 12 ms and
    that EN goes low before VDD(B) is switched off.
 5. Verify the Apollo3 interrupt handler sees offset `0x01`, validates
